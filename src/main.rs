@@ -12,17 +12,37 @@ use winit::{
 
 mod renderer;
 
-fn get_image(args: Args) -> anyhow::Result<Image> {
-    let path = args.skip(1).next().unwrap();
-    Ok(ImageReader::open(path)?.decode()?.to_rgba8())
+const K: u32 = 10;
+fn get_args() -> anyhow::Result<(Image, u32)> {
+    let mut args = std::env::args().skip(1);
+    let path = args.next().unwrap();
+    let image = ImageReader::open(path)?.decode()?.to_rgba8();
+    let k = args
+        .next()
+        .map(|k| k.parse::<u32>())
+        .transpose()?
+        .unwrap_or(K);
+    Ok((image, k))
 }
 
 pub type Image = ImageBuffer<Rgba<u8>, Vec<u8>>;
 
 struct App<'a> {
     image: Image,
+    k: u32,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer<'a>>,
+}
+
+impl<'a> App<'a> {
+    fn new(image: Image, k: u32) -> Self {
+        App {
+            image,
+            k,
+            window: None,
+            renderer: None,
+        }
+    }
 }
 
 impl<'a> ApplicationHandler for App<'a> {
@@ -36,17 +56,17 @@ impl<'a> ApplicationHandler for App<'a> {
             )))
             .unwrap();
         let window = Arc::new(window);
-        let renderer = Renderer::new(window.clone(), self.image.clone())
+        let renderer = Renderer::new(window.clone(), self.image.clone(), self.k)
             .block_on()
             .unwrap();
         self.renderer = Some(renderer);
-        self.window = Some(window.into());
+        self.window = Some(window);
     }
 
     fn window_event(
         &mut self,
         event_loop: &winit::event_loop::ActiveEventLoop,
-        window_id: winit::window::WindowId,
+        _window_id: winit::window::WindowId,
         event: winit::event::WindowEvent,
     ) {
         match event {
@@ -60,15 +80,12 @@ impl<'a> ApplicationHandler for App<'a> {
         }
     }
 }
+
 fn main() -> anyhow::Result<()> {
-    let image = get_image(std::env::args())?;
+    let (image, k) = get_args()?;
     let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
-    let mut app = App {
-        image,
-        window: None,
-        renderer: None,
-    };
+    let mut app = App::new(image, k);
     event_loop.run_app(&mut app)?;
     Ok(())
 }

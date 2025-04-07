@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use image::EncodableLayout;
 use rand::Rng;
@@ -19,7 +19,7 @@ pub struct Renderer<'a> {
 }
 
 impl<'a> Renderer<'a> {
-    pub async fn new(window: Arc<Window>, image: Image) -> anyhow::Result<Self> {
+    pub async fn new(window: Arc<Window>, image: Image, k: u32) -> anyhow::Result<Self> {
         let dims = image.dimensions();
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN,
@@ -44,7 +44,9 @@ impl<'a> Renderer<'a> {
                         | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
                         | wgpu::Features::PUSH_CONSTANTS
                         | wgpu::Features::SHADER_INT64
-                        | wgpu::Features::BGRA8UNORM_STORAGE,
+                        | wgpu::Features::BGRA8UNORM_STORAGE
+                        | wgpu::Features::SUBGROUP
+                        | wgpu::Features::SUBGROUP_BARRIER,
                     required_limits: wgpu::Limits {
                         max_push_constant_size: 4,
                         ..Default::default()
@@ -61,6 +63,7 @@ impl<'a> Renderer<'a> {
             .copied()
             .find(|f| !f.is_srgb() && *f == wgpu::TextureFormat::Bgra8Unorm)
             .unwrap_or(surface_caps.formats[0]);
+        println!("Chose format {:?}", surface_format);
         let surface_config = wgpu::SurfaceConfiguration {
             // I'm guessing we need TEXTURE_BINDING to use in a compute shader
             usage: wgpu::TextureUsages::TEXTURE_BINDING
@@ -91,7 +94,7 @@ impl<'a> Renderer<'a> {
             usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::STORAGE_BINDING,
             view_formats: &[],
         });
-        let k_means_state = KmeansState::new(&device, image_texture.clone(), 10)?;
+        let k_means_state = KmeansState::new(&device, image_texture.clone(), k)?;
         let composite_bindgroup_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: None,
@@ -227,8 +230,7 @@ impl<'a> Renderer<'a> {
                     label: Some("commands"),
                 });
         if !self.k_means_done {
-            println!("Running");
-            // self.k_means_done = true;
+            self.k_means_done = true;
             self.k_means_state.run(&self.device, &self.queue)
         } else {
         };
@@ -315,6 +317,7 @@ impl KmeansState {
     fn create_phase2_pipeline(
         device: &wgpu::Device,
         bind_group_layout: &wgpu::BindGroupLayout,
+        pipeline_constants: &HashMap<String, f64>,
     ) -> wgpu::ComputePipeline {
         let shader = wgpu::include_wgsl!("shaders/assignment.wgsl");
         let shader_module = device.create_shader_module(shader);
@@ -331,7 +334,10 @@ impl KmeansState {
             layout: Some(&layout),
             module: &shader_module,
             entry_point: Some("phase2"),
-            compilation_options: Default::default(),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: pipeline_constants,
+                zero_initialize_workgroup_memory: false, // TODO
+            },
             cache: None,
         })
     }
@@ -426,17 +432,18 @@ impl KmeansState {
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
             bind_group_layouts: &[&assign_bind_group_layout],
-            push_constant_ranges: &[wgpu::PushConstantRange {
-                stages: wgpu::ShaderStages::COMPUTE,
-                range: 0..4,
-            }],
+            push_constant_ranges: &[],
         });
+        let pipeline_constants = [(String::from("k"), k as f64)].into_iter().collect();
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("Assignment pipeline"),
             layout: Some(&layout),
             module: &shader_module,
             entry_point: Some("main"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: &pipeline_constants,
+                zero_initialize_workgroup_memory: true,
+            },
             cache: None,
         });
         let create_bind_group = |centroid_buf1: &wgpu::Buffer, centroid_buf2: &wgpu::Buffer| {
@@ -488,13 +495,16 @@ impl KmeansState {
             count_buf,
             assignment_pipeline: pipeline,
             assignment_bind_groups,
-            phase2_pipeline: Self::create_phase2_pipeline(device, &assign_bind_group_layout),
+            phase2_pipeline: Self::create_phase2_pipeline(
+                device,
+                &assign_bind_group_layout,
+                &pipeline_constants,
+            ),
             k,
         })
     }
 
     fn run(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
-        assert!(self.k == 10);
         let mut rng = rand::rng();
         let zeros = vec![0; self.count_buf.size() as usize];
         let mut centroid_buf = vec![[255u64; 4]; self.k as usize];
@@ -504,11 +514,12 @@ impl KmeansState {
                 .for_each(|v| *v = rng.random_range(0..256))
         });
         queue.write_buffer(&self.centroids[0], 0, bytemuck::cast_slice(&centroid_buf));
-        queue.write_buffer(&self.centroids[1], 0, bytemuck::cast_slice(&centroid_buf));
         queue.write_buffer(&self.count_buf, 0, &zeros);
         centroid_buf.iter_mut().for_each(|c| *c = [0; 4]);
+        queue.write_buffer(&self.centroids[1], 0, bytemuck::cast_slice(&centroid_buf));
 
-        for i in 0..53 {
+        // TODO: add convergence tracking
+        for i in 0..103 {
             {
                 let mut encoder =
                     device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
@@ -519,7 +530,6 @@ impl KmeansState {
                             timestamp_writes: None,
                         });
                     compute_pass.set_pipeline(&self.assignment_pipeline);
-                    compute_pass.set_push_constants(0, &self.k.to_le_bytes()[..]);
                     compute_pass.set_bind_group(0, &self.assignment_bind_groups[i % 2], &[]);
                     compute_pass.dispatch_workgroups(
                         self.image_texture.width().div_ceil(8),
