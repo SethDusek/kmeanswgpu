@@ -1,7 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use image::EncodableLayout;
-use rand::Rng;
+use rand::{Rng, rng};
 use winit::window::Window;
 
 use crate::Image;
@@ -65,7 +65,6 @@ impl<'a> Renderer<'a> {
             .unwrap_or(surface_caps.formats[0]);
         println!("Chose format {:?}", surface_format);
         let surface_config = wgpu::SurfaceConfiguration {
-            // I'm guessing we need TEXTURE_BINDING to use in a compute shader
             usage: wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_DST
                 | wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -94,7 +93,7 @@ impl<'a> Renderer<'a> {
             usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::STORAGE_BINDING,
             view_formats: &[],
         });
-        let k_means_state = KmeansState::new(&device, image_texture.clone(), k)?;
+        let k_means_state = KmeansState::new(&device, image, image_texture.clone(), k)?;
         let composite_bindgroup_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: None,
@@ -230,10 +229,9 @@ impl<'a> Renderer<'a> {
                     label: Some("commands"),
                 });
         if !self.k_means_done {
-            self.k_means_done = true;
+            // self.k_means_done = true;
             self.k_means_state.run(&self.device, &self.queue)
-        } else {
-        };
+        }
         let cur_texture = self.surface.get_current_texture()?;
         let _ = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: None,
@@ -303,6 +301,7 @@ impl<'a> Renderer<'a> {
 
 struct KmeansState {
     // input image
+    input_image_buf: Image,
     image_texture: wgpu::Texture,
     assignment_texture: wgpu::Texture,
     centroids: [wgpu::Buffer; 2],
@@ -310,6 +309,8 @@ struct KmeansState {
     assignment_pipeline: wgpu::ComputePipeline,
     assignment_bind_groups: [wgpu::BindGroup; 2],
     phase2_pipeline: wgpu::ComputePipeline,
+    convergence_tracker: wgpu::Buffer,
+    staging: wgpu::Buffer,
     k: u32,
 }
 
@@ -319,15 +320,12 @@ impl KmeansState {
         bind_group_layout: &wgpu::BindGroupLayout,
         pipeline_constants: &HashMap<String, f64>,
     ) -> wgpu::ComputePipeline {
-        let shader = wgpu::include_wgsl!("shaders/assignment.wgsl");
+        let shader = wgpu::include_wgsl!("shaders/kmeans.wgsl");
         let shader_module = device.create_shader_module(shader);
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
             bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[wgpu::PushConstantRange {
-                stages: wgpu::ShaderStages::COMPUTE,
-                range: 0..4,
-            }],
+            push_constant_ranges: &[],
         });
         device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: None,
@@ -342,7 +340,12 @@ impl KmeansState {
         })
     }
 
-    fn new(device: &wgpu::Device, input_image: wgpu::Texture, k: u32) -> anyhow::Result<Self> {
+    fn new(
+        device: &wgpu::Device,
+        input_image_buf: Image,
+        input_image: wgpu::Texture,
+        k: u32,
+    ) -> anyhow::Result<Self> {
         let centroid_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Centroids Buffer 1"),
             size: 8 * 4 * (k as u64),
@@ -361,6 +364,20 @@ impl KmeansState {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let convergence_tracker = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Convergence tracker"),
+            size: size_of::<u32>() as u64,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Staging"),
+            size: size_of::<u32>() as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let assignment_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Assignment Buffer"),
             size: input_image.size(),
@@ -371,7 +388,7 @@ impl KmeansState {
             usage: wgpu::TextureUsages::STORAGE_BINDING,
             view_formats: &[],
         });
-        let shader = wgpu::include_wgsl!("shaders/assignment.wgsl");
+        let shader = wgpu::include_wgsl!("shaders/kmeans.wgsl");
         let shader_module = device.create_shader_module(shader);
         let assign_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -424,6 +441,16 @@ impl KmeansState {
                             access: wgpu::StorageTextureAccess::WriteOnly,
                             format: wgpu::TextureFormat::R32Uint,
                             view_dimension: wgpu::TextureViewDimension::D2,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
                         },
                         count: None,
                     },
@@ -481,6 +508,12 @@ impl KmeansState {
                             &assignment_texture.create_view(&Default::default()),
                         ),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::Buffer(
+                            convergence_tracker.as_entire_buffer_binding(),
+                        ),
+                    },
                 ],
             })
         };
@@ -489,6 +522,7 @@ impl KmeansState {
             create_bind_group(&centroid_buf2, &centroid_buf),
         ];
         Ok(Self {
+            input_image_buf,
             image_texture: input_image,
             assignment_texture,
             centroids: [centroid_buf, centroid_buf2],
@@ -500,27 +534,41 @@ impl KmeansState {
                 &assign_bind_group_layout,
                 &pipeline_constants,
             ),
+            convergence_tracker,
+            staging,
             k,
         })
     }
 
+    fn is_converged(&self, device: &wgpu::Device) -> bool {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let slice = self.staging.slice(..);
+        slice.map_async(wgpu::MapMode::Read, move |r| tx.send(r).unwrap());
+        device.poll(wgpu::Maintain::wait());
+        rx.recv().unwrap().unwrap();
+        assert!(slice.get_mapped_range().len() == size_of::<u32>());
+        let not_converged = u32::from_be_bytes(slice.get_mapped_range()[..].try_into().unwrap());
+        self.staging.unmap();
+        not_converged == 0
+    }
+
     fn run(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
-        let mut rng = rand::rng();
         let zeros = vec![0; self.count_buf.size() as usize];
-        let mut centroid_buf = vec![[255u64; 4]; self.k as usize];
+        let mut centroid_buf = vec![[0u64; 4]; self.k as usize];
+        queue.write_buffer(&self.centroids[1], 0, bytemuck::cast_slice(&centroid_buf));
         centroid_buf.iter_mut().for_each(|c| {
-            c.iter_mut()
-                .take(3)
-                .for_each(|v| *v = rng.random_range(0..256))
+            let pixel = self.input_image_buf.get_pixel(
+                rng().random_range(0..self.input_image_buf.width()),
+                rng().random_range(0..self.input_image_buf.height()),
+            );
+            *c = pixel.0.map(|v| v as u64);
         });
         queue.write_buffer(&self.centroids[0], 0, bytemuck::cast_slice(&centroid_buf));
         queue.write_buffer(&self.count_buf, 0, &zeros);
-        centroid_buf.iter_mut().for_each(|c| *c = [0; 4]);
-        queue.write_buffer(&self.centroids[1], 0, bytemuck::cast_slice(&centroid_buf));
 
-        // TODO: add convergence tracking
-        for i in 0..103 {
+        for i in 0.. {
             {
+                queue.write_buffer(&self.convergence_tracker, 0, &zeros[0..size_of::<u32>()]);
                 let mut encoder =
                     device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
                 {
@@ -540,10 +588,21 @@ impl KmeansState {
                     compute_pass.set_bind_group(0, &self.assignment_bind_groups[i % 2], &[]);
                     compute_pass.dispatch_workgroups(self.k, 1, 1);
                 }
+                encoder.copy_buffer_to_buffer(
+                    &self.convergence_tracker,
+                    0,
+                    &self.staging,
+                    0,
+                    std::mem::size_of::<u32>() as u64,
+                );
 
                 queue.submit([encoder.finish()]);
+                // i % 2 is a temporary hack since the composite pipeline only reads from the first centroid buffer
+                if self.is_converged(device) && i % 2 == 0 {
+                    println!("Converged after {i} iterations");
+                    break;
+                }
             }
         }
-        // encoder.finish()
     }
 }
