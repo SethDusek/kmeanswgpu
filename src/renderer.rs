@@ -1,10 +1,39 @@
+use core::f32;
 use std::{collections::HashMap, sync::Arc};
 
 use image::EncodableLayout;
 use rand::{Rng, rng};
+use wgpu::util::DeviceExt;
 use winit::window::Window;
 
 use crate::Image;
+
+// uniform state for composite shader, see equivalent definition in shaders/composite.wgsl
+#[derive(bytemuck::Pod, bytemuck::Zeroable, Copy, Clone, PartialEq)]
+#[repr(C)]
+struct MouseState {
+    // This is not a bool because WGSL bool size, alignment is 4 so transmuting UniformState wouldn't be possible with bool mouse_clicked
+    mouse_clicked: u32,
+    mouse_x: f32,
+    mouse_y: f32,
+}
+
+impl MouseState {
+    fn new() -> Self {
+        MouseState {
+            mouse_clicked: 0,
+            mouse_x: 0.0,
+            mouse_y: 0.0,
+        }
+    }
+    fn set_mouse_state(&mut self, clicked: bool) {
+        self.mouse_clicked = clicked as u32;
+    }
+    fn set_mouse_pos(&mut self, mouse_x: f32, mouse_y: f32) {
+        self.mouse_x = mouse_x;
+        self.mouse_y = mouse_y;
+    }
+}
 
 pub struct Renderer<'a> {
     device: wgpu::Device,
@@ -15,6 +44,8 @@ pub struct Renderer<'a> {
     composite_texture: wgpu::Texture,
     composite_bindgroup: wgpu::BindGroup,
     composite_pipeline: wgpu::ComputePipeline,
+    mouse_state: MouseState,
+    mouse_state_buffer: wgpu::Buffer,
     k_means_done: bool,
 }
 
@@ -93,6 +124,14 @@ impl<'a> Renderer<'a> {
             usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::STORAGE_BINDING,
             view_formats: &[],
         });
+
+        let mouse_state = MouseState::new();
+        let mouse_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Mouse buffer"),
+            contents: bytemuck::bytes_of(&mouse_state),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
         let k_means_state = KmeansState::new(&device, image, image_texture.clone(), k)?;
         let composite_bindgroup_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -128,6 +167,16 @@ impl<'a> Renderer<'a> {
                         },
                         count: None,
                     },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
                 ],
             });
         let composite_bindgroup = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -152,6 +201,12 @@ impl<'a> Renderer<'a> {
                     binding: 2,
                     resource: wgpu::BindingResource::TextureView(
                         &composite_texture.create_view(&Default::default()),
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Buffer(
+                        mouse_buffer.as_entire_buffer_binding(),
                     ),
                 },
             ],
@@ -180,8 +235,27 @@ impl<'a> Renderer<'a> {
             composite_texture,
             composite_bindgroup,
             composite_pipeline,
+            mouse_state: MouseState::new(),
+            mouse_state_buffer: mouse_buffer,
             k_means_done: false,
         })
+    }
+
+    pub fn update_mouse_position(&mut self, x: f32, y: f32) {
+        self.mouse_state.set_mouse_pos(x, y);
+        self.upload_mouse_state();
+    }
+    pub fn mouse_clicked(&mut self, down: bool) {
+        self.mouse_state.set_mouse_state(down);
+        self.upload_mouse_state();
+    }
+
+    fn upload_mouse_state(&self) {
+        self.queue.write_buffer(
+            &self.mouse_state_buffer,
+            0,
+            bytemuck::bytes_of(&self.mouse_state),
+        );
     }
 
     // Queue image upload
@@ -229,7 +303,7 @@ impl<'a> Renderer<'a> {
                     label: Some("commands"),
                 });
         if !self.k_means_done {
-            // self.k_means_done = true;
+            self.k_means_done = true;
             self.k_means_state.run(&self.device, &self.queue)
         }
         let cur_texture = self.surface.get_current_texture()?;
@@ -553,6 +627,7 @@ impl KmeansState {
     }
 
     fn run(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        let start = std::time::Instant::now();
         let zeros = vec![0; self.count_buf.size() as usize];
         let mut centroid_buf = vec![[0u64; 4]; self.k as usize];
         queue.write_buffer(&self.centroids[1], 0, bytemuck::cast_slice(&centroid_buf));
@@ -604,5 +679,6 @@ impl KmeansState {
                 }
             }
         }
+        println!("Elapsed: {:?}", start.elapsed());
     }
 }

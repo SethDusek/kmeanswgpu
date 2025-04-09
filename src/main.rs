@@ -1,4 +1,4 @@
-use std::{env::Args, sync::Arc};
+use std::sync::Arc;
 
 use image::{ImageBuffer, ImageReader, Rgba};
 use pollster::FutureExt;
@@ -6,6 +6,7 @@ use renderer::Renderer;
 use winit::{
     application::ApplicationHandler,
     dpi::Size,
+    event::MouseButton,
     event_loop::EventLoop,
     window::{Window, WindowAttributes},
 };
@@ -76,6 +77,26 @@ impl<'a> ApplicationHandler for App<'a> {
             winit::event::WindowEvent::RedrawRequested => {
                 self.renderer.as_mut().map(|r| r.render());
             }
+            winit::event::WindowEvent::CursorMoved {
+                device_id: _,
+                position,
+            } => {
+                self.renderer.as_mut().map(|r| {
+                    r.update_mouse_position(position.x as f32, position.y as f32);
+                });
+                self.window.as_mut().map(|window| window.request_redraw());
+            }
+            winit::event::WindowEvent::MouseInput {
+                device_id: _,
+                state,
+                button: MouseButton::Left,
+            } => {
+                self.renderer
+                    .as_mut()
+                    .map(|r| r.mouse_clicked(state.is_pressed()));
+                self.window.as_mut().map(|window| window.request_redraw());
+            }
+
             _ => {}
         }
     }
